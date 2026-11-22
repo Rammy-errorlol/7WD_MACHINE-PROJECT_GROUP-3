@@ -84,6 +84,15 @@ def clip_text(text: str, limit: int = 1000) -> str:
     return text.encode("utf-8")[:limit].decode("utf-8", "ignore")
 
 
+def _turn_locked(fn):
+    """Run a turn-state method while holding the node's turn lock (listener thread and resolve thread share state)."""
+    def wrapper(self, *args, **kwargs):
+        with self._turn_lock:
+            return fn(self, *args, **kwargs)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
 class Peer7WDNode:
     def __init__(self, display_name: str, room_code: str, host: str, game_port: int,
                  lobby_port: int = 7777, verbose: bool = False, spectator: bool = False,
@@ -109,6 +118,7 @@ class Peer7WDNode:
 
         self.manifest: Dict[int, Tuple[str, int]] = {}
         self.manifest_names: Dict[int, str] = {}
+        self.hello_acks_received: Set[int] = set()
         self.spectator_addrs: Set[Tuple[str, int]] = set()
 
         self.channel_seq: Dict[int, int] = {}
@@ -128,6 +138,7 @@ class Peer7WDNode:
         self.my_seat = 0
         self.my_wonder_board: Dict[str, Any] = {}
         self.all_wonders: Dict[int, Dict[str, Any]] = {}
+        self.selected_guilds: List[str] = []
 
         self.card_engine = CardDatabaseEngine(card_db)
         self.current_age = 1
@@ -150,6 +161,15 @@ class Peer7WDNode:
         self.action_announcements: Dict[int, dict] = {}
         self.age_end_shields: Dict[int, int] = {}
         self.collected_score_reports: Dict[int, dict] = {}
+        self.game_end_broadcasted = False
+
+        self.resources_bought_this_turn: List[Dict[str, Any]] = []
+        self.pending_offers: Dict[int, Dict[str, int]] = {}
+        self.offer_event = threading.Event()
+        self.pending_seed_reveals: Dict[int, bytes] = {}
+        self.my_pass_sent = False                      # my outbound HAND_PASS for this turn has been sent
+        self.inbound_hand: Optional[dict] = None       # neighbour's HAND_PASS, held until my own turn is finished
+        self.pending_card_reveals: Dict[int, dict] = {}
 
         self.chosen_card: Optional[Dict[str, Any]] = None
         self.chosen_action: str = "BUILD"
@@ -160,6 +180,7 @@ class Peer7WDNode:
         self.incident_reports: Dict[str, Set[int]] = {}
         self.disconnected_peers: Set[int] = set()
         self.state_lock = threading.Lock()
+        self._turn_lock = threading.RLock()
 
         # UDP Sockets Setup
         self.game_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -249,6 +270,8 @@ class Peer7WDNode:
             self.log("SENT", addr, 0, 0, ack_number, FLAG_ACK, {})
 
     def broadcast_mesh(self, opcode: int, payload: dict, reliable: bool = True):
+        if self.spectator:
+            return
         for pid in list(self.manifest.keys()):
             if pid != self.manifest_peer_id and pid not in self.disconnected_peers:
                 if reliable and (opcode not in UNRELIABLE_MESSAGES):
@@ -258,6 +281,29 @@ class Peer7WDNode:
 
         for s_addr in list(self.spectator_addrs):
             self.send_unreliable(s_addr, opcode, payload)
+
+    def broadcast_error(self, code: str, detail: str, offending_pid: Optional[int] = None):
+        payload = {"code": code, "detail": detail}
+        if offending_pid is not None:
+            # RFC 8.3: offending_peer is a SEAT (falls back to the peer id before the ring exists)
+            payload["offending_peer"] = self.seating_order.index(offending_pid) if offending_pid in self.seating_order else offending_pid
+        print(f"\n[!] RAISING ERROR {code}: {detail}")
+        self.broadcast_mesh(MSG_ERROR, payload)
+
+    def leave_lobby(self):
+        if self.lobby_closed:
+            return
+        payload = {"lobby_peer_id": self.lobby_peer_id}
+        raw = self.pack_packet(MSG_LOBBY_LEAVE, payload, seq=0, ack=0)
+        self.log("SENT", ("<broadcast>", self.lobby_port), MSG_LOBBY_LEAVE, 0, 0, 0, payload)
+        targets = [("<broadcast>", self.lobby_port), ("127.0.0.1", self.lobby_port)]
+        for info in list(self.lobby_roster.values()):
+            targets.append((info["host"], info["port"]))
+        for dest in targets:
+            try:
+                self.lobby_sock.sendto(raw, dest)
+            except Exception:
+                pass
 
     def _retransmission_daemon(self):
         while self.running:
@@ -398,6 +444,13 @@ class Peer7WDNode:
         if opcode == MSG_LOBBY_PRESENCE:
             self._handle_presence_packet(payload, addr)
 
+        elif opcode == MSG_LOBBY_LEAVE and not self.lobby_closed:
+            lpid = payload.get("lobby_peer_id")
+            with self.state_lock:
+                if lpid and lpid in self.lobby_roster:
+                    del self.lobby_roster[lpid]
+                    self.last_roster_change = time.time()
+
         elif opcode == MSG_LOBBY_START_VOTE and not self.lobby_closed:
             proposed = payload.get("participants", [])
             if self.spectator:
@@ -474,6 +527,7 @@ class Peer7WDNode:
                 self.manifest_peer_id = rank
                 self.manifest[rank] = (self.host, self.game_port)
                 self.manifest_names[rank] = self.display_name
+                self.hello_acks_received.add(rank)
             else:
                 pinfo = self.lobby_roster.get(lpid)
                 if pinfo:
@@ -509,6 +563,8 @@ class Peer7WDNode:
 
     def _handle_seed_commit(self, sender_pid: int, payload: dict):
         self.collected_commits[sender_pid] = payload["commitment"]
+        if sender_pid in self.pending_seed_reveals:      # its reveal overtook it: verify now
+            self._handle_seed_reveal(sender_pid, {"nonce": self.pending_seed_reveals.pop(sender_pid).hex()})
         if not self.spectator and self.manifest_peer_id not in self.collected_commits:
             self.start_seed_ceremony()
         self._check_seed_commit_barrier()
@@ -522,6 +578,14 @@ class Peer7WDNode:
 
     def _handle_seed_reveal(self, sender_pid: int, payload: dict):
         nonce_bytes = bytes.fromhex(payload["nonce"])
+        expected_commit = self.collected_commits.get(sender_pid)
+        if not expected_commit:
+            # The SEED_COMMIT was lost/reordered and has not arrived yet: hold the reveal and verify it later
+            self.pending_seed_reveals[sender_pid] = nonce_bytes
+            return
+        if sha256_hex(nonce_bytes) != expected_commit:
+            self.broadcast_error("COMMITMENT_MISMATCH", f"SEED_REVEAL mismatch from peer {sender_pid}", sender_pid)
+            return
         self.collected_reveals[sender_pid] = nonce_bytes
         self._check_seed_reveal_barrier()
 
@@ -534,6 +598,9 @@ class Peer7WDNode:
             live_pids = sorted(list(self.manifest.keys()))
             self.seating_order = self.card_engine.derive_ring_seating(self.shared_seed, live_pids)
             self.all_wonders = self.card_engine.assign_wonders(self.shared_seed, self.seating_order)
+            self.selected_guilds = [
+                g["card_id"] for g in self.card_engine.select_guild_cards(self.shared_seed, len(self.seating_order))
+            ]
 
             for pid in self.seating_order:
                 self.public_tableaus[pid] = {
@@ -551,8 +618,10 @@ class Peer7WDNode:
                 self.resources[self.my_wonder_board["starting_resource"]] += 1
                 self.broadcast_mesh(MSG_RING_CONFIRM, {
                     "seat": self.my_seat,
+                    "seating_order": self.seating_order,
                     "wonder_board": self.my_wonder_board["board"],
-                    "wonder_side": self.my_wonder_board["side"]
+                    "wonder_side": self.my_wonder_board["side"],
+                    "guilds": self.selected_guilds
                 })
                 self._deal_age(1)
             else:
@@ -563,11 +632,26 @@ class Peer7WDNode:
                     print(f"  Seat {s_idx}: {pname:<10} | Wonder: {wb['board']} (Side {wb['side']}) | Starts with {wb['starting_resource']}")
                 print("\n[SPECTATOR] Age 1 has begun! Live monitoring card drafts...\n")
 
+    def _handle_ring_confirm(self, sender_pid: int, payload: dict):
+        if self.shared_seed is None:
+            return
+        expected_seat = self.seating_order.index(sender_pid) if sender_pid in self.seating_order else -1
+        expected_wb = self.all_wonders.get(sender_pid, {})
+        if (payload.get("seat") != expected_seat or
+                payload.get("wonder_board") != expected_wb.get("board") or
+                payload.get("wonder_side") != expected_wb.get("side") or
+                payload.get("seating_order", self.seating_order) != self.seating_order or
+                payload.get("guilds", self.selected_guilds) != self.selected_guilds):
+            self.broadcast_error("RING_MISMATCH", f"RING_CONFIRM mismatch from peer {sender_pid}", sender_pid)
+
     def _deal_age(self, age: int):
         self.current_age = age
         self.current_turn = 1
         self.revealed_this_turn = False
         self.announced_this_turn = False
+        self.resources_bought_this_turn.clear()
+        self.my_pass_sent = False
+        self.inbound_hand = None
         full_deck = self.card_engine.build_age_deck(self.shared_seed, age, len(self.seating_order))
         self.current_hand = full_deck[self.my_seat * 7 : (self.my_seat + 1) * 7]
         print(f"\n=======================================================")
@@ -584,6 +668,65 @@ class Peer7WDNode:
             print(f"  {idx}: {card['name']:<20} | Color: {card['color']:<6} | Cost: {card['cost']:<14} | Chain: {card['chain_from']}")
         print("To act: type 'pick <index> [BUILD / DISCARD / WONDER]'")
 
+    def trade_resource(self, direction: str, resource: str):
+        if self.spectator or not self.seating_order:
+            return
+        k = len(self.seating_order)
+        offset = -1 if direction.lower() == "left" else 1
+        target_pid = self.seating_order[(self.my_seat + offset) % k]
+        res_key = resource.upper()
+        self.send_reliable(target_pid, MSG_RESOURCE_QUERY, {
+            "age": self.current_age,
+            "turn": self.current_turn,
+            "resource": res_key,
+            "quantity": 1
+        })
+
+    def _handle_resource_query(self, sender_pid: int, payload: dict):
+        res_key = payload.get("resource", "").upper()
+        qty = int(payload.get("quantity", 1))
+        avail = min(qty, self.resources.get(res_key, 0))
+        self.send_reliable(sender_pid, MSG_RESOURCE_OFFER, {
+            "age": self.current_age,
+            "turn": self.current_turn,
+            "resource": res_key,
+            "available": avail
+        })
+
+    def _handle_resource_offer(self, sender_pid: int, payload: dict):
+        res_key = payload.get("resource", "").upper()
+        avail = int(payload.get("available", 0))
+        self.pending_offers.setdefault(sender_pid, {})[res_key] = avail
+        self.offer_event.set()
+
+        if not self.revealed_this_turn and avail > 0:
+            k = len(self.seating_order)
+            left_pid = self.seating_order[(self.my_seat - 1) % k]
+            is_mfg = res_key in ("GLASS", "PAPYRUS", "TEXTILE")
+            unit_price = self.trade_discounts["mfg"] if is_mfg else (
+                self.trade_discounts["raw_left"] if sender_pid == left_pid else self.trade_discounts["raw_right"]
+            )
+            if self.coins >= unit_price:
+                self.coins -= unit_price
+                self.resources_bought_this_turn.append({
+                    "peer_id": sender_pid, "resource": res_key, "quantity": 1, "coins_paid": unit_price
+                })
+                self.send_reliable(sender_pid, MSG_RESOURCE_BUY, {
+                    "age": self.current_age,
+                    "turn": self.current_turn,
+                    "resource": res_key,
+                    "quantity": 1,
+                    "coins_paid": unit_price
+                })
+
+    def _handle_resource_buy(self, sender_pid: int, payload: dict):
+        paid = int(payload.get("coins_paid", 0))
+        self.coins += paid
+        if self.manifest_peer_id in self.public_tableaus:
+            self.public_tableaus[self.manifest_peer_id]["coins"] = self.coins
+        if sender_pid in self.public_tableaus:
+            self.public_tableaus[sender_pid]["coins"] = self.public_tableaus[sender_pid].get("coins", 3) - paid
+
     def draft_action(self, card_idx: int, action: str = "BUILD"):
         if self.spectator:
             print("[SPECTATOR] Spectators cannot draft cards.")
@@ -595,6 +738,9 @@ class Peer7WDNode:
         act = action.upper()
         if act == "WONDER":
             act = "WONDER_STAGE"
+        if act not in ("BUILD", "WONDER_STAGE", "DISCARD"):
+            print("[!] Action must be BUILD, DISCARD or WONDER.")
+            return
 
         card = self.current_hand[card_idx]
         self.chosen_card = card
@@ -614,10 +760,15 @@ class Peer7WDNode:
         })
         self._check_card_commit_barrier()
 
+    @_turn_locked
     def _handle_card_commit(self, sender_pid: int, payload: dict):
         self.card_commits[sender_pid] = payload["commitment"]
+        early = self.pending_card_reveals.pop(sender_pid, None)
+        if early is not None:                              # its reveal overtook it: verify now
+            self._handle_card_reveal(sender_pid, early)
         self._check_card_commit_barrier()
 
+    @_turn_locked
     def _check_card_commit_barrier(self):
         if not self.spectator and self.chosen_card is not None and not self.revealed_this_turn:
             if len(self.card_commits) == len(self.seating_order):
@@ -635,20 +786,88 @@ class Peer7WDNode:
                 self.card_reveals[self.manifest_peer_id] = reveal_payload
                 self._check_card_reveal_barrier()
 
+    @_turn_locked
     def _handle_card_reveal(self, sender_pid: int, payload: dict):
+        expected_commit = self.card_commits.get(sender_pid)
+        cid = payload.get("card_id", "")
+        act = payload.get("action", "")
+        nonce_bytes = bytes.fromhex(payload.get("nonce", ""))
+        if not expected_commit and not self.spectator:
+            self.pending_card_reveals[sender_pid] = payload   # commit not here yet: verify once it arrives
+            return
+        if expected_commit and cid:
+            token = cid.encode("utf-8") + act.encode("utf-8") + nonce_bytes
+            if sha256_hex(token) != expected_commit:
+                self.broadcast_error("COMMITMENT_MISMATCH", f"CARD_REVEAL mismatch from peer {sender_pid}", sender_pid)
+                return
         self.card_reveals[sender_pid] = payload
         self._check_card_reveal_barrier()
 
+    @_turn_locked
     def _check_card_reveal_barrier(self):
         if not self.spectator and self.revealed_this_turn and not self.announced_this_turn:
             if len(self.card_reveals) == len(self.seating_order):
                 self.announced_this_turn = True
-                self._execute_resolve_and_announce()
+                threading.Thread(target=self._execute_resolve_and_announce, daemon=True).start()
+
+    def _acquire_missing_resources(self, res_req: Dict[str, int], coins_req: int) -> bool:
+        bought_counts = {r: 0 for r in RESOURCE_KEYS}
+        for b in self.resources_bought_this_turn:
+            bought_counts[b["resource"]] = bought_counts.get(b["resource"], 0) + b["quantity"]
+
+        deficit = {
+            r: max(0, amt - self.resources.get(r, 0) - bought_counts.get(r, 0))
+            for r, amt in res_req.items()
+        }
+        if sum(deficit.values()) == 0:
+            return self.coins >= coins_req
+
+        k = len(self.seating_order)
+        left_pid = self.seating_order[(self.my_seat - 1) % k]
+        right_pid = self.seating_order[(self.my_seat + 1) % k]
+        self.pending_offers.clear()
+
+        for r, need in deficit.items():
+            if need > 0:
+                self.offer_event.clear()
+                self.send_reliable(left_pid, MSG_RESOURCE_QUERY, {"age": self.current_age, "turn": self.current_turn, "resource": r, "quantity": need})
+                if right_pid != left_pid:
+                    self.send_reliable(right_pid, MSG_RESOURCE_QUERY, {"age": self.current_age, "turn": self.current_turn, "resource": r, "quantity": need})
+                self.offer_event.wait(timeout=1.0)
+
+                is_mfg = r in ("GLASS", "PAPYRUS", "TEXTILE")
+                neighbors = sorted(
+                    [(left_pid, self.trade_discounts["mfg"] if is_mfg else self.trade_discounts["raw_left"]),
+                     (right_pid, self.trade_discounts["mfg"] if is_mfg else self.trade_discounts["raw_right"])],
+                    key=lambda x: x[1]
+                )
+                rem = need
+                for npid, uprice in neighbors:
+                    avail = self.pending_offers.get(npid, {}).get(r, 0)
+                    take = min(rem, avail)
+                    if take > 0 and (self.coins - coins_req) >= take * uprice:
+                        paid = take * uprice
+                        self.coins -= paid
+                        rem -= take
+                        self.resources_bought_this_turn.append({"peer_id": npid, "resource": r, "quantity": take, "coins_paid": paid})
+                        self.send_reliable(npid, MSG_RESOURCE_BUY, {
+                            "age": self.current_age, "turn": self.current_turn,
+                            "resource": r, "quantity": take, "coins_paid": paid
+                        })
+                if rem > 0:
+                    return False
+        return self.coins >= coins_req
 
     def _execute_resolve_and_announce(self):
         card = self.chosen_card
         action = self.chosen_action
         self.current_hand = [c for c in self.current_hand if c["instance_id"] != card["instance_id"]]
+
+        if action == "BUILD":
+            coins_req, res_req = parse_card_cost(card["cost"])
+            is_chained = verify_chaining(card, self.built_cards)
+            if not is_chained and not self._acquire_missing_resources(res_req, coins_req):
+                action = "DISCARD"
 
         announce_payload = {
             "action": action,
@@ -660,7 +879,10 @@ class Peer7WDNode:
         if action == "BUILD":
             coins_req, _ = parse_card_cost(card["cost"])
             is_chained = verify_chaining(card, self.built_cards)
-            cost_paid = {"coins": 0 if is_chained else coins_req, "resources_bought": []}
+            cost_paid = {
+                "coins": 0 if is_chained else coins_req,
+                "resources_bought": list(self.resources_bought_this_turn)
+            }
 
             self.coins -= cost_paid["coins"]
             self.built_cards.append(card)
@@ -676,6 +898,7 @@ class Peer7WDNode:
         elif action == "DISCARD":
             self.coins += 3
 
+        self.resources_bought_this_turn.clear()
         self.action_announcements[self.manifest_peer_id] = announce_payload
         self.broadcast_mesh(MSG_ACTION_ANNOUNCE, announce_payload)
         self._check_action_announce_barrier()
@@ -703,16 +926,29 @@ class Peer7WDNode:
             sym = "TABLET" if "Tablet" in eff else "COMPASS" if "Compass" in eff else "GEAR"
             self.science_symbols.append(sym)
 
+    @_turn_locked
     def _handle_action_announce(self, sender_pid: int, payload: dict):
         self.action_announcements[sender_pid] = payload
         act = payload.get("action")
         sender_name = payload.get("peer_name", self.manifest_names.get(sender_pid, f"Player {sender_pid}"))
         self.manifest_names[sender_pid] = sender_name
 
-        tab = self.public_tableaus.setdefault(sender_pid, {"built_cards": [], "coins": 3, "wonder_stages_built": 0})
+        tab = self.public_tableaus.setdefault(sender_pid, {
+            "built_cards": [], "coins": 3, "wonder_stages_built": 0,
+            "military_tokens": [], "science_symbols": []
+        })
         if act == "BUILD":
             cid = payload.get("card_id")
-            tab["built_cards"].append({"card_id": cid, "color": "UNKNOWN"})
+            card_obj = self.card_engine.lookup_card(cid) or {"card_id": cid, "color": "UNKNOWN", "effect": ""}
+            cost_paid = payload.get("cost_paid", {})
+            tab["coins"] = tab.get("coins", 3) - int(cost_paid.get("coins", 0))
+            if card_obj.get("color") == "YELLOW" and "3 coins" in card_obj.get("effect", ""):
+                tab["coins"] += 3
+            elif card_obj.get("color") == "GREEN":
+                eff = card_obj.get("effect", "")
+                sym = "TABLET" if "Tablet" in eff else "COMPASS" if "Compass" in eff else "GEAR"
+                tab.setdefault("science_symbols", []).append(sym)
+            tab["built_cards"].append(card_obj)
             if self.spectator:
                 print(f"[TURN {payload.get('turn')}] {sender_name} BUILT: '{cid}'")
         elif act == "WONDER_STAGE":
@@ -726,6 +962,7 @@ class Peer7WDNode:
 
         self._check_action_announce_barrier()
 
+    @_turn_locked
     def _check_action_announce_barrier(self):
         if not self.spectator and len(self.action_announcements) == len(self.seating_order):
             self._finalize_turn_and_pass()
@@ -733,6 +970,7 @@ class Peer7WDNode:
     def _finalize_turn_and_pass(self):
         self.card_commits.clear()
         self.card_reveals.clear()
+        self.pending_card_reveals.clear()
         self.action_announcements.clear()
         self.chosen_card = None
         self.revealed_this_turn = False
@@ -746,7 +984,6 @@ class Peer7WDNode:
         if self.current_turn == 6:
             print(f"\n[*] Turn 6 finished. Unplayed card silently set aside.")
             self.current_hand.clear()
-            # RFC 7.8: the Turn 6 HAND_PASS is still sent, but with an EMPTY cards array
             self.send_reliable(target_pid, MSG_HAND_PASS, {
                 "age": self.current_age, "turn": 6, "cards": []
             })
@@ -759,15 +996,29 @@ class Peer7WDNode:
             "cards": [c["card_id"] for c in self.current_hand]
         }
         self.send_reliable(target_pid, MSG_HAND_PASS, pass_payload)
+        self.my_pass_sent = True
+        self._try_advance_turn()
 
+    @_turn_locked
     def _handle_hand_pass(self, sender_pid: int, payload: dict):
         if self.spectator: return
         if payload.get("turn") == 6:
-            return  # Turn 6 pass carries an empty hand: nothing to deal, and the Age is ending
+            return
+        # RFC 7.8 step 6: do NOT start the next turn until my own turn is finished and my own pass is sent.
+        # A fast neighbour's hand can arrive while I am still resolving (e.g. waiting on a trade), so hold it.
+        self.inbound_hand = payload
+        self._try_advance_turn()
+
+    @_turn_locked
+    def _try_advance_turn(self):
+        if not (self.my_pass_sent and self.inbound_hand is not None):
+            return
+        payload, self.inbound_hand = self.inbound_hand, None
+        self.my_pass_sent = False
         cids = payload.get("cards", [])
         new_hand = []
         for cid in cids:
-            card = self.card_engine.lookup_card(cid)   # works for Age I/II/III cards AND guilds
+            card = self.card_engine.lookup_card(cid)
             if card is None:
                 print(f"[!] HAND_PASS contained unknown card_id '{cid}'")
                 continue
@@ -786,7 +1037,9 @@ class Peer7WDNode:
             "shields": self.military_shields,
             "peer_name": self.display_name
         })
+        self._check_age_end_barrier()
 
+    @_turn_locked
     def _handle_age_end(self, sender_pid: int, payload: dict):
         self.age_end_shields[sender_pid] = payload["shields"]
 
@@ -797,26 +1050,28 @@ class Peer7WDNode:
                 print(f"  {pname}: {sh} shields")
             self.age_end_shields.clear()
 
+        self._check_age_end_barrier()
+
+    @_turn_locked
+    def _check_age_end_barrier(self):
         if not self.spectator and len(self.age_end_shields) == len(self.seating_order):
             k = len(self.seating_order)
-            left_pid = self.seating_order[(self.my_seat - 1) % k]
-            right_pid = self.seating_order[(self.my_seat + 1) % k]
-
             win_vp = 1 if self.current_age == 1 else 3 if self.current_age == 2 else 5
-            if self.military_shields > self.age_end_shields[left_pid]:
-                self.military_tokens.append(win_vp)
-                print(f"[MILITARY] Victory vs Left Neighbor (Peer {left_pid})! (+{win_vp} VP)")
-            elif self.military_shields < self.age_end_shields[left_pid]:
-                self.military_tokens.append(-1)
-                print(f"[MILITARY] Defeat vs Left Neighbor (Peer {left_pid})! (-1 VP)")
 
-            if self.military_shields > self.age_end_shields[right_pid]:
-                self.military_tokens.append(win_vp)
-                print(f"[MILITARY] Victory vs Right Neighbor (Peer {right_pid})! (+{win_vp} VP)")
-            elif self.military_shields < self.age_end_shields[right_pid]:
-                self.military_tokens.append(-1)
-                print(f"[MILITARY] Defeat vs Right Neighbor (Peer {right_pid})! (-1 VP)")
+            for seat_idx, pid in enumerate(self.seating_order):
+                l_pid = self.seating_order[(seat_idx - 1) % k]
+                r_pid = self.seating_order[(seat_idx + 1) % k]
+                toks = self.public_tableaus[pid].setdefault("military_tokens", [])
+                if self.age_end_shields[pid] > self.age_end_shields[l_pid]:
+                    toks.append(win_vp)
+                elif self.age_end_shields[pid] < self.age_end_shields[l_pid]:
+                    toks.append(-1)
+                if self.age_end_shields[pid] > self.age_end_shields[r_pid]:
+                    toks.append(win_vp)
+                elif self.age_end_shields[pid] < self.age_end_shields[r_pid]:
+                    toks.append(-1)
 
+            self.military_tokens = list(self.public_tableaus[self.manifest_peer_id]["military_tokens"])
             self.age_end_shields.clear()
             if self.current_age < 3:
                 self._deal_age(self.current_age + 1)
@@ -838,10 +1093,29 @@ class Peer7WDNode:
         my_report = all_computed[self.manifest_peer_id]
         self.collected_score_reports[self.manifest_peer_id] = my_report
         self.broadcast_mesh(MSG_SCORE_REPORT, my_report)
+        self._check_score_barrier()
 
+    @_turn_locked
     def _handle_score_report(self, sender_pid: int, payload: dict):
         self.collected_score_reports[sender_pid] = payload
-        if len(self.collected_score_reports) == len(self.seating_order):
+        self._check_score_barrier()
+
+    @_turn_locked
+    def _check_score_barrier(self):
+        if len(self.collected_score_reports) == len(self.seating_order) and not self.game_end_broadcasted:
+            if not self.spectator:
+                expected_all = compute_all_scores(self.seating_order, self.public_tableaus)
+                cats = ("military", "wonder", "civilian", "scientific", "commercial", "guilds")
+                for pid, reported in self.collected_score_reports.items():
+                    exp = expected_all.get(pid, {})
+                    bad = [c for c in cats if reported.get(c) != exp.get(c)]
+                    if sum(reported.get(c, 0) for c in cats + ("treasury",)) != reported.get("total"):
+                        bad.append("total != sum of categories")
+                    if bad:
+                        self.broadcast_error("SCORE_MISMATCH", f"SCORE_REPORT mismatch from peer {pid}: {bad}", pid)
+                        return
+
+            self.game_end_broadcasted = True
             print("\n======================= FINAL SCOREBOARD =======================")
             ranked = []
             for pid, sc in self.collected_score_reports.items():
@@ -897,7 +1171,6 @@ class Peer7WDNode:
                     with self.state_lock:
                         if (sender_pid, ack) in self.unacked_packets:
                             del self.unacked_packets[(sender_pid, ack)]
-                            # RFC 6.3: a successful ACK resets the RTO (to the RTT-seeded base if we have one)
                             self.channel_rto[sender_pid] = self.channel_rto_base.get(sender_pid, RTO_INIT)
 
                 if opcode not in UNRELIABLE_MESSAGES and seq > 0 and not self.spectator:
@@ -911,8 +1184,7 @@ class Peer7WDNode:
                         self.delivered_seqs[sender_pid].add(seq)
                     self.send_bare_ack(sender_pid, seq)
 
-                # Route all lobby opcodes arrived on game_sock
-                if opcode in (MSG_LOBBY_PRESENCE, MSG_LOBBY_START_VOTE, MSG_LOBBY_START_ACK):
+                if opcode in (MSG_LOBBY_PRESENCE, MSG_LOBBY_LEAVE, MSG_LOBBY_START_VOTE, MSG_LOBBY_START_ACK):
                     self._handle_lobby_packet(opcode, payload, addr)
                 elif opcode == MSG_SPECTATOR_SYNC and self.spectator:
                     self.seating_order = payload.get("seating_order", [])
@@ -926,6 +1198,10 @@ class Peer7WDNode:
                     self.print_spectator_dashboard()
                 elif opcode == MSG_HELLO and not self.spectator:
                     self.send_reliable(sender_pid, MSG_HELLO_ACK, {})
+                elif opcode == MSG_HELLO_ACK and not self.spectator:
+                    self.hello_acks_received.add(sender_pid)
+                    if sender_pid in self.manifest:
+                        self.send_unreliable(self.manifest[sender_pid], MSG_PING, {"sent_at_ms": int(time.time() * 1000)})
                 elif opcode == MSG_PING and not self.spectator:
                     self.send_unreliable(addr, MSG_PONG, {"echo_sent_at_ms": payload.get("sent_at_ms", 0)})
                 elif opcode == MSG_PONG:
@@ -938,8 +1214,7 @@ class Peer7WDNode:
                 elif opcode == MSG_SEED_REVEAL:
                     self._handle_seed_reveal(sender_pid, payload)
                 elif opcode == MSG_RING_CONFIRM:
-                    if sender_pid not in self.seating_order:
-                        self.seating_order.append(sender_pid)
+                    self._handle_ring_confirm(sender_pid, payload)
                 elif opcode == MSG_CARD_COMMIT:
                     self._handle_card_commit(sender_pid, payload)
                 elif opcode == MSG_CARD_REVEAL:
@@ -948,21 +1223,27 @@ class Peer7WDNode:
                     self._handle_action_announce(sender_pid, payload)
                 elif opcode == MSG_HAND_PASS:
                     self._handle_hand_pass(sender_pid, payload)
+                elif opcode == MSG_RESOURCE_QUERY and not self.spectator:
+                    self._handle_resource_query(sender_pid, payload)
+                elif opcode == MSG_RESOURCE_OFFER and not self.spectator:
+                    self._handle_resource_offer(sender_pid, payload)
+                elif opcode == MSG_RESOURCE_BUY and not self.spectator:
+                    self._handle_resource_buy(sender_pid, payload)
                 elif opcode == MSG_AGE_END:
                     self._handle_age_end(sender_pid, payload)
                 elif opcode == MSG_SCORE_REPORT:
                     self._handle_score_report(sender_pid, payload)
                 elif opcode == MSG_GAME_END:
                     print("\n[+] Consensus reached: GAME_END broadcast confirmed.")
-                elif opcode == MSG_DIRECT_MESSAGE:
+                elif opcode == MSG_DIRECT_MESSAGE and not self.spectator:
                     print(f"\n[DM from Peer {sender_pid}]: {payload.get('text')}")
-                elif opcode == MSG_GROUP_MESSAGE:
+                elif opcode == MSG_GROUP_MESSAGE and not self.spectator:
                     print(f"\n[GROUP CHAT]: {payload.get('text')}")
                 elif opcode == MSG_ERROR:
                     print(f"\n[!] ERROR BROADCAST: {payload.get('code')} -> {payload.get('detail')}")
 
             except ConnectionResetError:
-                continue  # Windows: ICMP "port unreachable" from a peer that isn't running yet
+                continue
             except Exception as e:
                 print(f"[!] _game_listener error: {type(e).__name__}: {e}")
 
@@ -998,10 +1279,10 @@ def main():
         print("  start                    - Start Seed Commit ceremony")
         print("  pick <idx> [action]      - Draft card (action: BUILD, DISCARD, WONDER)")
         print("  trade <left/right> <res> - Query neighbor for resource")
+        print("  dm <peer_id> <text>      - Send DIRECT_MESSAGE (0x18)")
+        print("  msg <text>               - Send GROUP_MESSAGE (0x19)")
     else:
         print("  board                    - Display live spectator overview")
-    print("  dm <peer_id> <text>      - Send DIRECT_MESSAGE (0x18)")
-    print("  msg <text>               - Send GROUP_MESSAGE (0x19)")
     print("  ping <peer_id>           - Ping peer to test RTT/RTO")
     print("  verbose                  - Toggle runtime verbose mode on/off")
     print("  roster                   - Show manifest and seating order")
@@ -1022,9 +1303,11 @@ def main():
             elif cmd == "pick" and not node.spectator and len(parts) > 1:
                 action = parts[2].upper() if len(parts) > 2 else "BUILD"
                 node.draft_action(int(parts[1]), action)
-            elif cmd == "dm" and len(parts) > 2:
+            elif cmd == "trade" and not node.spectator and len(parts) > 2:
+                node.trade_resource(parts[1], parts[2])
+            elif cmd == "dm" and not node.spectator and len(parts) > 2:
                 node.send_reliable(int(parts[1]), MSG_DIRECT_MESSAGE, {"text": clip_text(parts[2])})
-            elif cmd == "msg" and len(parts) > 1:
+            elif cmd == "msg" and not node.spectator and len(parts) > 1:
                 node.broadcast_mesh(MSG_GROUP_MESSAGE, {"text": clip_text(line.split(" ", 1)[1])})
             elif cmd == "ping" and len(parts) > 1:
                 target_pid = int(parts[1])
@@ -1037,9 +1320,13 @@ def main():
                 print(f"Manifest: {node.manifest_names}")
                 print(f"Seating Ring: {node.seating_order} (My Seat: {node.my_seat})")
             elif cmd == "quit":
+                node.leave_lobby()
                 node.running = False
                 break
+        except ValueError:
+            print("[!] Invalid arguments: peer ids and card indexes must be numbers (use 'roster' to see peer ids).")
         except KeyboardInterrupt:
+            node.leave_lobby()
             node.running = False
             break
 
