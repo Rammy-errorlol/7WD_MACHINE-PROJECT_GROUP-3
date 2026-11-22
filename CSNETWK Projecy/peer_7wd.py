@@ -1721,7 +1721,7 @@ def main():
     print("  ping <peer_id>           - Ping peer to test RTT/RTO")
     print("  verbose                  - Toggle runtime verbose mode on/off")
     print("  roster                   - Show manifest, seating order and liveness")
-    print("  drop <peer_id>           - TEST ONLY: toggle silently dropping our outgoing packets to a peer")
+    print("  drop <peer_id>           - toggle silently dropping our outgoing packets to a peer")
     print("  quit                     - Exit node\n")
 
     while node.running:
