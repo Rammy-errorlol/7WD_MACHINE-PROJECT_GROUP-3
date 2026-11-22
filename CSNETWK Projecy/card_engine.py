@@ -1,6 +1,7 @@
 import pandas as pd
 import hashlib
 import struct
+import re
 from typing import List, Dict, Tuple, Any
 
 RESOURCE_KEYS = ["WOOD", "ORE", "CLAY", "STONE", "GLASS", "PAPYRUS", "TEXTILE"]
@@ -11,6 +12,13 @@ def sha256_hash(data: bytes) -> bytes:
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
+def card_shields(card: Dict[str, Any]) -> int:
+    """Shield count printed on a RED card, parsed from its effect text ('1 Military Shield', '2 Military Shields', ...)."""
+    if str(card.get("color", "")).upper() != "RED":
+        return 0
+    m = re.search(r"(\d+)\s+(?:Military\s+)?Shield", str(card.get("effect", "")), re.IGNORECASE)
+    return int(m.group(1)) if m else 0
+
 class CardDatabaseEngine:
     def __init__(self, excel_path: str = "Card Database 7WD.xlsx"):
         self.excel_path = excel_path
@@ -19,6 +27,31 @@ class CardDatabaseEngine:
         self.age3_df = self._read_sheet("Age III Cards")
         self.guilds_df = self._read_guilds("Guild Cards (Age III)")
         self.wonders_df = self._read_wonders("Wonder Boards")
+        self._card_index = self._build_card_index()
+
+    def _build_card_index(self) -> Dict[str, Dict[str, Any]]:
+        """card_id (exact 'Card Name', RFC 8.2) -> card definition, across all Ages and the Guilds."""
+        index: Dict[str, Dict[str, Any]] = {}
+        for df in (self.age1_df, self.age2_df, self.age3_df, self.guilds_df):
+            for _, row in df.iterrows():
+                cname = str(row["Card Name"]).strip()
+                if cname in index:
+                    continue
+                index[cname] = {
+                    "card_id": cname,
+                    "name": cname,
+                    "color": str(row.get("Color", "PURPLE")).strip().upper() if "Color" in df.columns else "PURPLE",
+                    "cost": str(row.get("Cost to Build", "Free")).strip(),
+                    "effect": str(row.get("Effect", "")).strip(),
+                    "chain_from": str(row.get("Free-Build After (Chain From)", "\u2014")).strip(),
+                    "chain_to": str(row.get("Enables Free Build Of (Chain To)", "\u2014")).strip(),
+                }
+        return index
+
+    def lookup_card(self, card_id: str):
+        """Return a fresh copy of the card named card_id, or None if it is not in the database."""
+        base = self._card_index.get(str(card_id).strip())
+        return dict(base) if base is not None else None
 
     def _read_sheet(self, sheet_name: str) -> pd.DataFrame:
         df = pd.read_excel(self.excel_path, sheet_name=sheet_name, skiprows=2)
@@ -34,23 +67,6 @@ class CardDatabaseEngine:
         df = pd.read_excel(self.excel_path, sheet_name=sheet_name, skiprows=2)
         df.columns = [str(col).strip() for col in df.iloc[0]]
         return df.iloc[1:].reset_index(drop=True)
-
-    def lookup_card(self, card_id: str):
-        """Return the full card dict for ANY card_id (Age I/II/III sheets or Guilds), or None."""
-        for df in (self.age1_df, self.age2_df, self.age3_df, self.guilds_df):
-            sub = df[df["Card Name"].astype(str).str.strip() == card_id]
-            if len(sub) > 0:
-                row = sub.iloc[0]
-                return {
-                    "card_id": card_id,
-                    "name": card_id,
-                    "color": "PURPLE" if df is self.guilds_df else str(row["Color"]).strip().upper(),
-                    "cost": str(row.get("Cost to Build", "Free")).strip(),
-                    "effect": str(row.get("Effect", "")).strip(),
-                    "chain_from": str(row.get("Free-Build After (Chain From)", "—")).strip(),
-                    "chain_to": str(row.get("Enables Free Build Of (Chain To)", "—")).strip(),
-                }
-        return None
 
     def derive_ring_seating(self, seed: bytes, live_peer_ids: List[int]) -> List[int]:
         scored = []

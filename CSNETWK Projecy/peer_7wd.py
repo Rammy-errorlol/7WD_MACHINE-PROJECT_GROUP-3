@@ -78,6 +78,11 @@ T_LOBBY_QUIET = 3.0
 T_LOBBY_TIMEOUT = 120.0
 MIN_PLAYERS = 3
 MAX_PLAYERS = 7
+T_SEED_TIMEOUT = 10.0       # RFC 10: SEED_COMMIT / SEED_REVEAL barrier window
+T_TURN_TIMEOUT = 8.0        # RFC 10: CARD_COMMIT barrier window
+T_RESOURCE_TIMEOUT = 5.0    # RFC 10: RESOURCE_OFFER reply window (also PING corroboration window)
+T_SCORE_TIMEOUT = 10.0      # RFC 10: SCORE_REPORT barrier window
+T_JOIN_TIMEOUT = 10.0       # RFC 10: HELLO collection window (7.5 / 11.1)
 
 def clip_text(text: str, limit: int = 1000) -> str:
     """RFC 8.3: chat text must be <= 1000 bytes of UTF-8."""
@@ -96,7 +101,7 @@ def _turn_locked(fn):
 class Peer7WDNode:
     def __init__(self, display_name: str, room_code: str, host: str, game_port: int,
                  lobby_port: int = 7777, verbose: bool = False, spectator: bool = False,
-                 card_db: str = "Card Database 7WD.xlsx"):
+                 card_db: str = "Card Database 7WD.xlsx", drop_to: Optional[List[int]] = None):
         self.display_name = display_name
         self.room_code = room_code
         self.host = host
@@ -169,7 +174,7 @@ class Peer7WDNode:
         self.offer_event = threading.Event()
         self.pending_seed_reveals: Dict[int, bytes] = {}
         self.my_pass_sent = False                      # my outbound HAND_PASS for this turn has been sent
-        self.inbound_hand: Optional[dict] = None       # neighbour's HAND_PASS, held until my own turn is finished
+        self.inbound_hands: List[dict] = []            # neighbour HAND_PASSes, held until my own turn is finished
         self.pending_card_reveals: Dict[int, dict] = {}
 
         self.chosen_card: Optional[Dict[str, Any]] = None
@@ -180,6 +185,21 @@ class Peer7WDNode:
 
         self.incident_reports: Dict[str, Set[int]] = {}
         self.disconnected_peers: Set[int] = set()
+        # --- DISCONNECT / liveness state (RFC 6.3, 7.9, 11.3) ---
+        self.aborted = False
+        self.failed_channels: Set[int] = set()      # 6.3: our sending direction to these peers is permanently failed
+        self.incidents: Dict[str, dict] = {}        # 7.9: incident_id -> {offender, reporters, echoed, ...}
+        self.last_pong: Dict[int, float] = {}
+        self.turn_misses: Dict[int, int] = {}       # consecutive missed CARD_COMMIT barriers per peer
+        self.turn_absent: Set[int] = set()          # peers excluded from THIS turn's barriers only
+        self.turn_phase_start: Optional[float] = None
+        self.seed_phase_start: Optional[float] = None
+        self.score_phase_start: Optional[float] = None
+        self.drop_to_pids: Set[int] = set(drop_to or [])   # TEST ONLY: swallow outgoing packets to these peers
+        self.last_heard: Dict[int, float] = {}               # 7.5: last datagram of any kind from each manifest peer
+        self.join_deadline: Optional[float] = None
+        self.lost_passes: Dict[int, List[dict]] = {}          # HAND_PASSes that never got through to a failed channel
+        self.last_pass: Optional[Tuple[int, dict]] = None    # (target_pid, payload) of my latest HAND_PASS
         self.state_lock = threading.Lock()
         self._turn_lock = threading.RLock()
 
@@ -198,6 +218,7 @@ class Peer7WDNode:
         threading.Thread(target=self._lobby_listener, daemon=True).start()
         threading.Thread(target=self._game_listener, daemon=True).start()
         threading.Thread(target=self._retransmission_daemon, daemon=True).start()
+        threading.Thread(target=self._barrier_watchdog, daemon=True).start()
         threading.Thread(target=self._lobby_gossip_daemon, daemon=True).start()
 
     def log(self, direction: str, addr: Tuple[str, int], opcode: int, seq: int, ack: int, flags: int, payload: dict):
@@ -236,7 +257,12 @@ class Peer7WDNode:
         return opcode, flags, sender_pid, sess_id, plen, seq, ack, payload
 
     def send_reliable(self, target_pid: int, opcode: int, payload: dict):
+        # RFC 6.3: once a channel has failed (or the peer is DISCONNECTED) we MUST NOT resume delivery on it.
         if target_pid not in self.manifest or self.spectator:
+            return
+        if target_pid in self.failed_channels:
+            if opcode == MSG_HAND_PASS and target_pid not in self.disconnected_peers:
+                self.lost_passes.setdefault(target_pid, []).append(payload)   # keep it: may need re-routing on DISCONNECT
             return
         addr = self.manifest[target_pid]
 
@@ -252,14 +278,14 @@ class Peer7WDNode:
                 "retries": 0, "last_sent": time.time(), "payload": payload, "seq": cur_seq
             }
 
-        self.game_sock.sendto(raw, addr)
+        self._raw_send(raw, addr)
         self.log("SENT", addr, opcode, cur_seq, ack_to_piggyback, flags, payload)
 
     def send_unreliable(self, addr: Tuple[str, int], opcode: int, payload: dict, ack_target: int = 0):
         flags = FLAG_ACK if ack_target > 0 else 0
         raw = self.pack_packet(opcode, payload, seq=0, ack=ack_target, flags=flags)
         try:
-            self.game_sock.sendto(raw, addr)
+            self._raw_send(raw, addr)
         except Exception:
             pass
         self.log("SENT", addr, opcode, 0, ack_target, flags, payload)
@@ -269,7 +295,7 @@ class Peer7WDNode:
             addr = self.manifest[target_pid]
             raw = self.pack_packet(0, {}, seq=0, ack=ack_number, flags=FLAG_ACK)
             try:
-                self.game_sock.sendto(raw, addr)
+                self._raw_send(raw, addr)
             except Exception:
                 pass
             self.log("SENT", addr, 0, 0, ack_number, FLAG_ACK, {})
@@ -287,8 +313,11 @@ class Peer7WDNode:
         for s_addr in list(self.spectator_addrs):
             self.send_unreliable(s_addr, opcode, payload)
 
-    def broadcast_error(self, code: str, detail: str, offending_pid: Optional[int] = None):
+    def broadcast_error(self, code: str, detail: str, offending_pid: Optional[int] = None,
+                        incident_id: Optional[str] = None):
         payload = {"code": code, "detail": detail}
+        if incident_id is not None:
+            payload["incident_id"] = incident_id      # RFC 8.3: REQUIRED for TIMEOUT incidents (7.9)
         if offending_pid is not None:
             # RFC 8.3: offending_peer is a SEAT (falls back to the peer id before the ring exists)
             payload["offending_peer"] = self.seating_order.index(offending_pid) if offending_pid in self.seating_order else offending_pid
@@ -310,11 +339,360 @@ class Peer7WDNode:
             except Exception:
                 pass
 
+    # ==================================================================
+    # DISCONNECT (0x17) - RFC 6.3, 7.6, 7.9, 7.11, 11.1, 11.3
+    #
+    #  * Broadcast-observable misses (SEED_COMMIT/REVEAL, SCORE_REPORT, bad SEED_REVEAL) are
+    #    decided by every peer independently, single miss.
+    #  * CARD_COMMIT barrier: two consecutive T_TURN_TIMEOUT misses.
+    #  * Directed/private failures (RESOURCE_QUERY timeout, RETRY_MAX on a channel) are NEVER
+    #    unilateral: they open an incident (ERROR TIMEOUT + incident_id) and the peer is only
+    #    marked DISCONNECTED once EVERY other live peer has echoed the same incident_id.
+    #  * "Marked DISCONNECTED" is a local state on each peer; the DISCONNECT message itself
+    #    ({reason}) is a peer announcing ITS OWN exit (USER_QUIT / QUORUM_LOST).
+    # ==================================================================
+    def _raw_send(self, raw: bytes, addr: Tuple[str, int]):
+        """Single choke point for game-channel datagrams (lets --drop-to / 'drop' simulate a dead link)."""
+        if self.drop_to_pids:
+            for pid, a in self.manifest.items():
+                if a == addr and pid in self.drop_to_pids:
+                    return
+        self.game_sock.sendto(raw, addr)
+
+    def _pname(self, pid: int) -> str:
+        return self.manifest_names.get(pid, f"Player {pid}")
+
+    def _live_pids(self) -> List[int]:
+        return sorted(p for p in self.manifest if p not in self.disconnected_peers)
+
+    def _live_ring(self) -> List[int]:
+        """The ring is NOT recomputed (11.3): disconnected seats are simply skipped."""
+        return [p for p in self.seating_order if p not in self.disconnected_peers]
+
+    def _neighbor_pid(self, offset: int) -> int:
+        ring = self._live_ring()
+        if self.manifest_peer_id not in ring or len(ring) < 2:
+            return self.manifest_peer_id
+        return ring[(ring.index(self.manifest_peer_id) + offset) % len(ring)]
+
+    def _expected_peers(self) -> Set[int]:
+        return set(self._live_ring()) - self.turn_absent
+
+    def announce_exit(self, reason: str):
+        """Best-effort DISCONNECT {reason} for OUR OWN exit; repeated because it is unreliable (8.1)."""
+        if self.spectator or not self.lobby_closed or self.manifest_peer_id == 0xFFFF:
+            return
+        for _ in range(3):
+            self.broadcast_mesh(MSG_DISCONNECT, {"reason": reason}, reliable=False)
+            time.sleep(0.05)
+
+    def _abort_quorum_lost(self):
+        if self.aborted:
+            return
+        self.aborted = True
+        print(f"\n[!] QUORUM LOST: fewer than {MIN_PLAYERS} live peers remain. Session ABORTED (RFC 11.1/11.3). Press Enter to exit.")
+        self.announce_exit("QUORUM_LOST")
+        self.running = False
+
+    def _mark_disconnected(self, pid: int, reason: str):
+        with self._turn_lock:
+            if pid == self.manifest_peer_id or pid in self.disconnected_peers or pid not in self.manifest:
+                return
+            self.disconnected_peers.add(pid)
+            lost_passes = list(self.lost_passes.pop(pid, []))
+            with self.state_lock:
+                self.failed_channels.add(pid)
+                for key in sorted(k for k in self.unacked_packets if k[0] == pid):
+                    item = self.unacked_packets[key]
+                    if item["opcode"] == MSG_HAND_PASS:
+                        lost_passes.append(item["payload"])      # never ACKed -> the dead seat never got it
+                    del self.unacked_packets[key]
+            self.pending_offers.pop(pid, None)
+            self.pending_seed_reveals.pop(pid, None)
+            self.pending_card_reveals.pop(pid, None)
+            print(f"\n[!] PEER DISCONNECTED: {self._pname(pid)} (peer {pid}) | reason: {reason}")
+            if len(self._live_pids()) < MIN_PLAYERS:
+                self._abort_quorum_lost()
+                return
+            # 11.3: the Ring is not recomputed. Every HAND_PASS that was still un-ACKed when the seat died is lost,
+            # even if I have already advanced to my next turn, so re-send each one to the next live seat.
+            for pl in lost_passes:
+                if pl.get("turn") == 6:
+                    continue
+                direction = -1 if pl.get("age", self.current_age) in (1, 3) else 1
+                new_target = self._neighbor_pid(direction)
+                if new_target != self.manifest_peer_id:
+                    print(f"[*] Re-routing my HAND_PASS (Age {pl.get('age')}, Turn {pl.get('turn')}) around the disconnected seat to {self._pname(new_target)} (peer {new_target})")
+                    self.send_reliable(new_target, MSG_HAND_PASS, pl)
+                    self.last_pass = (new_target, pl)
+            self._recheck_everything()
+
+    def _recheck_everything(self):
+        """A disconnect removes whatever was blocking every barrier, so re-evaluate all of them."""
+        for fn in (self._check_seed_commit_barrier, self._check_seed_reveal_barrier,
+                   self._check_card_commit_barrier, self._check_card_reveal_barrier,
+                   self._check_action_announce_barrier, self._check_age_end_barrier,
+                   self._check_score_barrier):
+            try:
+                fn()
+            except Exception as e:
+                print(f"[!] barrier recheck error in {fn.__name__}: {type(e).__name__}: {e}")
+        self._recheck_incidents()
+
+    # ---------------- barrier watchdog (single-miss / two-miss rules) ----------------
+    def _barrier_watchdog(self):
+        while self.running:
+            time.sleep(0.25)
+            try:
+                self._watchdog_tick()
+            except Exception as e:
+                print(f"[!] watchdog error: {type(e).__name__}: {e}")
+
+    def _watchdog_tick(self):
+        if self.spectator or not self.lobby_closed or self.aborted:
+            return
+        now = time.time()
+        with self._turn_lock:
+            # 7.5 / 11.1: a participant never heard from within T_JOIN_TIMEOUT is dropped before seeding
+            # (independently observable, so no corroboration); below min_players the session aborts.
+            if self.join_deadline is not None and now >= self.join_deadline:
+                self.join_deadline = None
+                if self.shared_seed is None:
+                    for p in sorted(self.manifest):
+                        if p != self.manifest_peer_id and p not in self.last_heard:
+                            print(f"[!] T_JOIN_TIMEOUT: never heard from {self._pname(p)} (peer {p})")
+                            self._mark_disconnected(p, "TIMEOUT")
+                            if self.aborted:
+                                return
+
+            # 7.6: SEED_COMMIT / SEED_REVEAL barriers - once per session, so a SINGLE miss disconnects.
+            if (self.shared_seed is None and self.seed_phase_start is not None
+                    and now - self.seed_phase_start >= T_SEED_TIMEOUT):
+                have = self.collected_reveals if self.manifest_peer_id in self.collected_reveals else self.collected_commits
+                missing = [p for p in self._live_pids() if p not in have]
+                self.seed_phase_start = now
+                for p in missing:
+                    print(f"[!] T_SEED_TIMEOUT: no seed message from {self._pname(p)} (peer {p})")
+                    self._mark_disconnected(p, "TIMEOUT")
+                    if self.aborted:
+                        return
+
+            # 7.8: CARD_COMMIT barrier - proceed without the silent peer this turn; TWO consecutive misses disconnect.
+            if (self.turn_phase_start is not None and self.shared_seed is not None
+                    and self.chosen_card is not None and not self.revealed_this_turn
+                    and now - self.turn_phase_start >= T_TURN_TIMEOUT):
+                self.turn_phase_start = now
+                missing = [p for p in self._expected_peers()
+                           if p != self.manifest_peer_id and p not in self.card_commits]
+                for p in missing:
+                    self.turn_absent.add(p)
+                    self.turn_misses[p] = self.turn_misses.get(p, 0) + 1
+                    print(f"[!] T_TURN_TIMEOUT: no CARD_COMMIT from {self._pname(p)} (peer {p}) "
+                          f"- consecutive misses: {self.turn_misses[p]}/2")
+                for p in missing:
+                    if self.turn_misses[p] >= 2:
+                        self._mark_disconnected(p, "TIMEOUT")
+                        if self.aborted:
+                            return
+                self._check_card_commit_barrier()
+
+            # 7.11: SCORE_REPORT barrier - single miss disconnects, excluded from GAME_END.
+            if (self.score_phase_start is not None and not self.game_end_broadcasted
+                    and now - self.score_phase_start >= T_SCORE_TIMEOUT):
+                self.score_phase_start = None
+                for p in [p for p in self._live_ring() if p not in self.collected_score_reports]:
+                    print(f"[!] T_SCORE_TIMEOUT: no SCORE_REPORT from {self._pname(p)} (peer {p})")
+                    self._mark_disconnected(p, "TIMEOUT")
+                    if self.aborted:
+                        return
+                self._check_score_barrier()
+
+    # ---------------- directed-failure path: incident + corroboration (7.9, 6.3) ----------------
+    def _on_channel_failed(self, pid: int):
+        """6.3: our channel to `pid` exhausted RETRY_MAX. Alone this does NOT disconnect it (11.3)."""
+        if self.spectator or pid in self.disconnected_peers:
+            return
+        print(f"\n[!] CHANNEL FAILED: {self._pname(pid)} (peer {pid}) exceeded RETRY_MAX. Our sending direction to it is "
+              f"now permanently closed (RFC 6.3). The peer stays LIVE unless every other live peer's channel to it "
+              f"fails too (11.3). If it is a neighbour carrying HAND_PASS, this turn may stall (RFC 12.4).")
+        with self._turn_lock:
+            open_ids = [i for i, inc in self.incidents.items() if inc["offender"] == pid and not inc["resolved"]]
+            if open_ids:
+                for iid in open_ids:
+                    self._echo(iid)            # our own channel has exceeded RETRY_MAX: that is our corroboration
+            else:
+                self._open_incident(pid, f"channel to peer {pid} exceeded RETRY_MAX")
+
+    def _get_incident(self, iid: str, offender: int, detail: str = "") -> dict:
+        inc = self.incidents.get(iid)
+        if inc is None:
+            inc = {"offender": offender, "reporters": set(), "echoed": False, "testing": False,
+                   "resolved": False, "alive": False,
+                   "detail": detail or f"peer {offender} unresponsive"}
+            self.incidents[iid] = inc
+        return inc
+
+    def _open_incident(self, offender: int, detail: str):
+        """7.9: fresh incident_id + ERROR{TIMEOUT} broadcast. NEVER marks the offender disconnected by itself."""
+        with self._turn_lock:
+            if offender == self.manifest_peer_id or offender in self.disconnected_peers:
+                return
+            iid = os.urandom(8).hex()
+            self._get_incident(iid, offender, detail)
+            self._echo(iid)
+
+    def _echo(self, iid: str):
+        """Broadcast ERROR{TIMEOUT, offending_peer, incident_id} (original report or corroboration)."""
+        with self._turn_lock:
+            inc = self.incidents[iid]
+            if inc["echoed"] or inc["resolved"] or inc["offender"] in self.disconnected_peers:
+                return
+            inc["echoed"] = True
+            inc["reporters"].add(self.manifest_peer_id)
+            self.broadcast_error("TIMEOUT", inc["detail"], inc["offender"], incident_id=iid)
+            self._check_incident(iid)
+
+    @_turn_locked
+    def _handle_error(self, sender_pid: int, payload: dict):
+        if self.spectator or payload.get("code") != "TIMEOUT" or not payload.get("incident_id"):
+            return
+        iid = payload["incident_id"]
+        seat = payload.get("offending_peer")
+        if isinstance(seat, int) and self.seating_order and 0 <= seat < len(self.seating_order):
+            offender = self.seating_order[seat]            # offending_peer is a SEAT (RFC 8.3)
+        else:
+            offender = seat
+        if offender not in self.manifest or offender == self.manifest_peer_id or offender in self.disconnected_peers:
+            return
+        inc = self._get_incident(iid, offender, str(payload.get("detail", "")))
+        inc["reporters"].add(sender_pid)
+        if not inc["echoed"] and not inc["testing"]:
+            if offender in self.failed_channels:
+                self._echo(iid)                            # our channel already exceeded RETRY_MAX
+            else:
+                inc["testing"] = True
+                threading.Thread(target=self._corroborate_by_ping, args=(iid,), daemon=True).start()
+        self._check_incident(iid)
+
+    def _corroborate_by_ping(self, iid: str):
+        """7.9: test OUR channel to the accused with PING; re-send once after T_RESOURCE_TIMEOUT; only if
+        both attempts get no PONG do we echo the SAME incident_id."""
+        inc = self.incidents[iid]
+        off = inc["offender"]
+        addr = self.manifest.get(off)
+        alive = False
+        for _attempt in range(2):
+            t0 = time.time()
+            if addr is not None:
+                self.send_unreliable(addr, MSG_PING, {"sent_at_ms": int(t0 * 1000)})
+            while time.time() < t0 + T_RESOURCE_TIMEOUT:
+                if self.last_pong.get(off, 0.0) >= t0:
+                    alive = True
+                    break
+                time.sleep(0.05)
+            if alive:
+                break
+        with self._turn_lock:
+            if alive:
+                inc["alive"] = True
+                print(f"[*] Incident {iid[:8]}: peer {off} answered our PING - NOT corroborating (stays connected).")
+                return
+            self._echo(iid)
+
+    def _check_incident(self, iid: str):
+        inc = self.incidents.get(iid)
+        if inc is None or inc["resolved"]:
+            return
+        off = inc["offender"]
+        if off == self.manifest_peer_id or off in self.disconnected_peers:
+            inc["resolved"] = True
+            return
+        needed = set(self._live_pids()) - {off}            # every OTHER live peer must have echoed this incident_id
+        if needed and needed <= inc["reporters"]:
+            inc["resolved"] = True
+            print(f"[*] Incident {iid[:8]}: all {len(needed)} other live peers corroborated -> consensus on peer {off}.")
+            # Consensus reached: broadcast DISCONNECT (best-effort, 8.1). {reason} is the RFC payload; offending_peer /
+            # peer_id / incident_id are extensions (receivers ignore unknown fields) naming who the consensus is about.
+            seat = self.seating_order.index(off) if off in self.seating_order else off
+            self.broadcast_mesh(MSG_DISCONNECT, {"reason": "TIMEOUT", "offending_peer": seat,
+                                                 "peer_id": off, "incident_id": iid}, reliable=False)
+            self._mark_disconnected(off, "TIMEOUT")
+
+    def _recheck_incidents(self):
+        for iid in list(self.incidents):
+            self._check_incident(iid)
+
+    # ---------------- incoming DISCONNECT ----------------
+    def _handle_disconnect(self, sender_pid: int, payload: dict):
+        """DISCONNECT {reason}: the SENDER is leaving (USER_QUIT) or halting (QUORUM_LOST / PROTOCOL_VIOLATION)."""
+        reason = payload.get("reason", "USER_QUIT")
+        if sender_pid not in self.manifest:
+            return
+        if self.spectator:
+            if sender_pid not in self.disconnected_peers:
+                self.disconnected_peers.add(sender_pid)
+                print(f"[SPECTATOR] {self._pname(sender_pid)} DISCONNECTED ({reason})")
+            return
+        target = self._target_from_payload(payload)
+        if target is None or target == sender_pid:
+            # The sender announces its OWN departure (USER_QUIT / QUORUM_LOST): no consensus needed.
+            print(f"\n[!] DISCONNECT received from {self._pname(sender_pid)} (peer {sender_pid}), reason={reason}")
+            self._mark_disconnected(sender_pid, reason)
+            return
+        if target == self.manifest_peer_id:
+            # Never abort on someone else's say-so (a forged packet could kill us); just log it loudly.
+            print(f"\n[!] WARNING: {self._pname(sender_pid)} (peer {sender_pid}) reports THIS node as DISCONNECTED "
+                  f"({reason}). Not acting on it.")
+            return
+        if target in self.disconnected_peers:
+            return
+        # Third-party report: never adopt it blindly (11.3). If it came from a corroborated incident, join that
+        # incident (test our own channel with PING); barrier-miss cases we detect ourselves.
+        print(f"\n[*] {self._pname(sender_pid)} reports {self._pname(target)} DISCONNECTED ({reason}); not acting on it unilaterally.")
+        iid = payload.get("incident_id")
+        if isinstance(iid, str) and iid:
+            seat = self.seating_order.index(target) if target in self.seating_order else target
+            self._handle_error(sender_pid, {"code": "TIMEOUT", "incident_id": iid,
+                                            "offending_peer": seat, "detail": "reported via DISCONNECT"})
+
+    def _target_from_payload(self, payload: dict) -> Optional[int]:
+        """Who a DISCONNECT is about: peer_id extension first, else offending_peer (a seat). None = the sender itself."""
+        pid = payload.get("peer_id")
+        if isinstance(pid, int) and pid in self.manifest:
+            return pid
+        seat = payload.get("offending_peer")
+        if isinstance(seat, int):
+            if self.seating_order:
+                return self.seating_order[seat] if 0 <= seat < len(self.seating_order) else None
+            return seat if seat in self.manifest else None
+        return None
+
+    # ---------------- RESOURCE_QUERY with 7.9 timeout discipline ----------------
+    def _query_neighbors(self, pids: List[int], res: str, qty: int) -> List[int]:
+        """Query, wait T_RESOURCE_TIMEOUT, re-send ONCE, wait again. Returns neighbours that never replied."""
+        def replied(p: int) -> bool:
+            return res in self.pending_offers.get(p, {})
+
+        for _attempt in range(2):
+            for p in pids:
+                if not replied(p):
+                    self.send_reliable(p, MSG_RESOURCE_QUERY, {
+                        "age": self.current_age, "turn": self.current_turn, "resource": res, "quantity": qty
+                    })
+            deadline = time.time() + T_RESOURCE_TIMEOUT
+            while time.time() < deadline and not all(replied(p) for p in pids):
+                self.offer_event.clear()
+                self.offer_event.wait(timeout=0.1)
+            if all(replied(p) for p in pids):
+                break
+        return [p for p in pids if not replied(p)]
+
     def _retransmission_daemon(self):
         while self.running:
             now = time.time()
             to_resend = []
             to_exhaust = []
+            newly_failed = []
 
             with self.state_lock:
                 for (target_pid, seq), item in list(self.unacked_packets.items()):
@@ -329,7 +707,15 @@ class Peer7WDNode:
                         else:
                             to_exhaust.append(((target_pid, seq), item))
 
-                for key, _ in to_exhaust:
+                # RFC 6.3: RETRY_MAX exhausted -> this CHANNEL is failed for good. That alone does NOT
+                # disconnect the peer (11.3); it is handled by _on_channel_failed() below.
+                for (tp, _seq), _item in to_exhaust:
+                    if tp not in self.failed_channels:
+                        self.failed_channels.add(tp)
+                        newly_failed.append(tp)
+                for key in sorted(k for k in self.unacked_packets if k[0] in self.failed_channels):
+                    if self.unacked_packets[key]["opcode"] == MSG_HAND_PASS:
+                        self.lost_passes.setdefault(key[0], []).append(self.unacked_packets[key]["payload"])
                     del self.unacked_packets[key]
 
             for item in to_resend:
@@ -339,10 +725,16 @@ class Peer7WDNode:
                     flags=FLAG_RETRANSMIT
                 )
                 try:
-                    self.game_sock.sendto(raw_with_retx, item["addr"])
+                    self._raw_send(raw_with_retx, item["addr"])
                 except Exception:
                     pass
                 self.log("RETRY", item["addr"], item["opcode"], item["seq"], 0, FLAG_RETRANSMIT, item["payload"])
+
+            for tp in newly_failed:
+                try:
+                    self._on_channel_failed(tp)
+                except Exception as e:
+                    print(f"[!] _on_channel_failed error: {type(e).__name__}: {e}")
 
             time.sleep(0.02)
 
@@ -550,6 +942,7 @@ class Peer7WDNode:
         print(f"=======================================================\n")
 
         if not self.spectator:
+            self.join_deadline = time.time() + T_JOIN_TIMEOUT
             for pid in self.manifest:
                 if pid != self.manifest_peer_id:
                     self.send_reliable(pid, MSG_HELLO, {})
@@ -563,6 +956,7 @@ class Peer7WDNode:
             return
         print("\n[*] Randomness Ceremony initiated...")
         self.collected_commits[self.manifest_peer_id] = self.my_commitment
+        self.seed_phase_start = time.time()
         self.broadcast_mesh(MSG_SEED_COMMIT, {"commitment": self.my_commitment})
         self._check_seed_commit_barrier()
 
@@ -574,9 +968,11 @@ class Peer7WDNode:
             self.start_seed_ceremony()
         self._check_seed_commit_barrier()
 
+    @_turn_locked
     def _check_seed_commit_barrier(self):
-        if not self.spectator and len(self.collected_commits) == len(self.manifest):
+        if not self.spectator and set(self._live_pids()) <= set(self.collected_commits):
             if self.manifest_peer_id not in self.collected_reveals:
+                self.seed_phase_start = time.time()      # start the SEED_REVEAL window (T_SEED_TIMEOUT)
                 self.collected_reveals[self.manifest_peer_id] = self.my_nonce
                 self.broadcast_mesh(MSG_SEED_REVEAL, {"nonce": self.my_nonce.hex()})
                 self._check_seed_reveal_barrier()
@@ -590,17 +986,21 @@ class Peer7WDNode:
             return
         if sha256_hex(nonce_bytes) != expected_commit:
             self.broadcast_error("COMMITMENT_MISMATCH", f"SEED_REVEAL mismatch from peer {sender_pid}", sender_pid)
+            # 7.6 step 3 / 11.3: broadcast-observable -> every peer disconnects it independently, no corroboration.
+            self._mark_disconnected(sender_pid, "PROTOCOL_VIOLATION")
             return
         self.collected_reveals[sender_pid] = nonce_bytes
         self._check_seed_reveal_barrier()
 
+    @_turn_locked
     def _check_seed_reveal_barrier(self):
-        req_reveals = len(self.manifest)
-        if len(self.collected_reveals) >= req_reveals and self.shared_seed is None:
-            concat_nonces = b"".join(self.collected_reveals[pid] for pid in sorted(self.collected_reveals.keys()))
+        live_pids = self._live_pids()
+        if live_pids and set(live_pids) <= set(self.collected_reveals) and self.shared_seed is None:
+            # 7.6: n_i concatenated only over SURVIVING peers, ascending Sender Peer ID
+            concat_nonces = b"".join(self.collected_reveals[pid] for pid in live_pids)
             self.shared_seed = sha256_hash(concat_nonces)
+            self.seed_phase_start = None
 
-            live_pids = sorted(list(self.manifest.keys()))
             self.seating_order = self.card_engine.derive_ring_seating(self.shared_seed, live_pids)
             self.all_wonders = self.card_engine.assign_wonders(self.shared_seed, self.seating_order)
             self.selected_guilds = [
@@ -656,7 +1056,7 @@ class Peer7WDNode:
         self.announced_this_turn = False
         self.resources_bought_this_turn.clear()
         self.my_pass_sent = False
-        self.inbound_hand = None
+        self.inbound_hands = [h for h in self.inbound_hands if h.get("age", 0) >= age]
         full_deck = self.card_engine.build_age_deck(self.shared_seed, age, len(self.seating_order))
         self.current_hand = full_deck[self.my_seat * 7 : (self.my_seat + 1) * 7]
         print(f"\n=======================================================")
@@ -676,9 +1076,8 @@ class Peer7WDNode:
     def trade_resource(self, direction: str, resource: str):
         if self.spectator or not self.seating_order:
             return
-        k = len(self.seating_order)
         offset = -1 if direction.lower() == "left" else 1
-        target_pid = self.seating_order[(self.my_seat + offset) % k]
+        target_pid = self._neighbor_pid(offset)
         res_key = resource.upper()
         self.send_reliable(target_pid, MSG_RESOURCE_QUERY, {
             "age": self.current_age,
@@ -705,8 +1104,7 @@ class Peer7WDNode:
         self.offer_event.set()
 
         if not self.revealed_this_turn and avail > 0:
-            k = len(self.seating_order)
-            left_pid = self.seating_order[(self.my_seat - 1) % k]
+            left_pid = self._neighbor_pid(-1)
             is_mfg = res_key in ("GLASS", "PAPYRUS", "TEXTILE")
             unit_price = self.trade_discounts["mfg"] if is_mfg else (
                 self.trade_discounts["raw_left"] if sender_pid == left_pid else self.trade_discounts["raw_right"]
@@ -756,6 +1154,7 @@ class Peer7WDNode:
         commit_digest = sha256_hex(token)
 
         self.card_commits[self.manifest_peer_id] = commit_digest
+        self.turn_phase_start = time.time()      # start the T_TURN_TIMEOUT CARD_COMMIT window
         print(f"[*] Committed {self.chosen_action} on '{card['name']}'. Waiting for other players...")
 
         self.broadcast_mesh(MSG_CARD_COMMIT, {
@@ -768,6 +1167,8 @@ class Peer7WDNode:
     @_turn_locked
     def _handle_card_commit(self, sender_pid: int, payload: dict):
         self.card_commits[sender_pid] = payload["commitment"]
+        if sender_pid not in self.turn_absent:
+            self.turn_misses[sender_pid] = 0     # 11.3: only CONSECUTIVE misses count
         early = self.pending_card_reveals.pop(sender_pid, None)
         if early is not None:                              # its reveal overtook it: verify now
             self._handle_card_reveal(sender_pid, early)
@@ -776,8 +1177,9 @@ class Peer7WDNode:
     @_turn_locked
     def _check_card_commit_barrier(self):
         if not self.spectator and self.chosen_card is not None and not self.revealed_this_turn:
-            if len(self.card_commits) == len(self.seating_order):
+            if self._expected_peers() <= set(self.card_commits):
                 self.revealed_this_turn = True
+                self.turn_phase_start = None
                 reveal_payload = {
                     "age": self.current_age,
                     "turn": self.current_turn,
@@ -811,7 +1213,7 @@ class Peer7WDNode:
     @_turn_locked
     def _check_card_reveal_barrier(self):
         if not self.spectator and self.revealed_this_turn and not self.announced_this_turn:
-            if len(self.card_reveals) == len(self.seating_order):
+            if self._expected_peers() <= set(self.card_reveals):
                 self.announced_this_turn = True
                 threading.Thread(target=self._execute_resolve_and_announce, daemon=True).start()
 
@@ -827,18 +1229,19 @@ class Peer7WDNode:
         if sum(deficit.values()) == 0:
             return self.coins >= coins_req
 
-        k = len(self.seating_order)
-        left_pid = self.seating_order[(self.my_seat - 1) % k]
-        right_pid = self.seating_order[(self.my_seat + 1) % k]
+        left_pid = self._neighbor_pid(-1)
+        right_pid = self._neighbor_pid(+1)
         self.pending_offers.clear()
 
         for r, need in deficit.items():
             if need > 0:
-                self.offer_event.clear()
-                self.send_reliable(left_pid, MSG_RESOURCE_QUERY, {"age": self.current_age, "turn": self.current_turn, "resource": r, "quantity": need})
-                if right_pid != left_pid:
-                    self.send_reliable(right_pid, MSG_RESOURCE_QUERY, {"age": self.current_age, "turn": self.current_turn, "resource": r, "quantity": need})
-                self.offer_event.wait(timeout=1.0)
+                queried = [p for p in dict.fromkeys((left_pid, right_pid))
+                           if p != self.manifest_peer_id
+                           and p not in self.failed_channels and p not in self.disconnected_peers]
+                silent = self._query_neighbors(queried, r, need)
+                for sp in silent:
+                    # 7.9: private, directed timeout -> open an incident; NEVER disconnect unilaterally.
+                    self._open_incident(sp, f"no RESOURCE_OFFER for {r} within T_RESOURCE_TIMEOUT (after one re-send)")
 
                 is_mfg = r in ("GLASS", "PAPYRUS", "TEXTILE")
                 neighbors = sorted(
@@ -969,7 +1372,8 @@ class Peer7WDNode:
 
     @_turn_locked
     def _check_action_announce_barrier(self):
-        if not self.spectator and len(self.action_announcements) == len(self.seating_order):
+        if (not self.spectator and self.manifest_peer_id in self.action_announcements
+                and self._expected_peers() <= set(self.action_announcements)):
             self._finalize_turn_and_pass()
 
     def _finalize_turn_and_pass(self):
@@ -977,14 +1381,14 @@ class Peer7WDNode:
         self.card_reveals.clear()
         self.pending_card_reveals.clear()
         self.action_announcements.clear()
+        self.turn_absent.clear()
+        self.turn_phase_start = None
         self.chosen_card = None
         self.revealed_this_turn = False
         self.announced_this_turn = False
 
-        k = len(self.seating_order)
         direction = -1 if self.current_age in (1, 3) else 1
-        neighbor_seat = (self.my_seat + direction) % k
-        target_pid = self.seating_order[neighbor_seat]
+        target_pid = self._neighbor_pid(direction)      # 11.3: disconnected seats are skipped
 
         if self.current_turn == 6:
             print(f"\n[*] Turn 6 finished. Unplayed card silently set aside.")
@@ -1001,6 +1405,7 @@ class Peer7WDNode:
             "cards": [c["card_id"] for c in self.current_hand]
         }
         self.send_reliable(target_pid, MSG_HAND_PASS, pass_payload)
+        self.last_pass = (target_pid, pass_payload)
         self.my_pass_sent = True
         self._try_advance_turn()
 
@@ -1011,14 +1416,22 @@ class Peer7WDNode:
             return
         # RFC 7.8 step 6: do NOT start the next turn until my own turn is finished and my own pass is sent.
         # A fast neighbour's hand can arrive while I am still resolving (e.g. waiting on a trade), so hold it.
-        self.inbound_hand = payload
+        key = (payload.get("age"), payload.get("turn"))
+        if any((h.get("age"), h.get("turn")) == key for h in self.inbound_hands):
+            return                                   # duplicate (e.g. original + re-routed copy)
+        self.inbound_hands.append(payload)
         self._try_advance_turn()
 
     @_turn_locked
     def _try_advance_turn(self):
-        if not (self.my_pass_sent and self.inbound_hand is not None):
+        if not self.my_pass_sent:
             return
-        payload, self.inbound_hand = self.inbound_hand, None
+        match = [h for h in self.inbound_hands
+                 if h.get("age") == self.current_age and h.get("turn") == self.current_turn]
+        if not match:
+            return
+        payload = match[0]
+        self.inbound_hands.remove(payload)
         self.my_pass_sent = False
         cids = payload.get("cards", [])
         new_hand = []
@@ -1059,13 +1472,15 @@ class Peer7WDNode:
 
     @_turn_locked
     def _check_age_end_barrier(self):
-        if not self.spectator and len(self.age_end_shields) == len(self.seating_order):
-            k = len(self.seating_order)
+        live = self._live_ring()
+        if (not self.spectator and live and set(live) <= set(self.age_end_shields)
+                and self.manifest_peer_id in self.age_end_shields):
+            k = len(live)          # disconnected peers are excluded from military comparisons (11.3)
             win_vp = 1 if self.current_age == 1 else 3 if self.current_age == 2 else 5
 
-            for seat_idx, pid in enumerate(self.seating_order):
-                l_pid = self.seating_order[(seat_idx - 1) % k]
-                r_pid = self.seating_order[(seat_idx + 1) % k]
+            for seat_idx, pid in enumerate(live):
+                l_pid = live[(seat_idx - 1) % k]
+                r_pid = live[(seat_idx + 1) % k]
                 toks = self.public_tableaus[pid].setdefault("military_tokens", [])
                 if self.age_end_shields[pid] > self.age_end_shields[l_pid]:
                     toks.append(win_vp)
@@ -1094,10 +1509,11 @@ class Peer7WDNode:
             "wonder_board": self.my_wonder_board
         }
 
-        all_computed = compute_all_scores(self.seating_order, self.public_tableaus)
+        all_computed = compute_all_scores(self._live_ring(), self.public_tableaus)
         my_report = all_computed[self.manifest_peer_id]
         self.collected_score_reports[self.manifest_peer_id] = my_report
         self.broadcast_mesh(MSG_SCORE_REPORT, my_report)
+        self.score_phase_start = time.time()     # start the T_SCORE_TIMEOUT window
         self._check_score_barrier()
 
     @_turn_locked
@@ -1107,11 +1523,15 @@ class Peer7WDNode:
 
     @_turn_locked
     def _check_score_barrier(self):
-        if len(self.collected_score_reports) == len(self.seating_order) and not self.game_end_broadcasted:
+        live = self._live_ring()
+        if (live and set(live) <= set(self.collected_score_reports) and not self.game_end_broadcasted
+                and (self.spectator or self.manifest_peer_id in self.collected_score_reports)):
+            # disconnected peers are excluded from the cross-check and from GAME_END's final_scores (7.11)
+            reports = {p: r for p, r in self.collected_score_reports.items() if p in live}
             if not self.spectator:
-                expected_all = compute_all_scores(self.seating_order, self.public_tableaus)
+                expected_all = compute_all_scores(live, self.public_tableaus)
                 cats = ("military", "wonder", "civilian", "scientific", "commercial", "guilds")
-                for pid, reported in self.collected_score_reports.items():
+                for pid, reported in reports.items():
                     exp = expected_all.get(pid, {})
                     bad = [c for c in cats if reported.get(c) != exp.get(c)]
                     if sum(reported.get(c, 0) for c in cats + ("treasury",)) != reported.get("total"):
@@ -1123,7 +1543,7 @@ class Peer7WDNode:
             self.game_end_broadcasted = True
             print("\n======================= FINAL SCOREBOARD =======================")
             ranked = []
-            for pid, sc in self.collected_score_reports.items():
+            for pid, sc in reports.items():
                 ranked.append((pid, sc["total"], self.public_tableaus[pid].get("coins", 0), sc))
             ranked.sort(key=lambda x: (x[1], x[2]), reverse=True)
 
@@ -1137,7 +1557,7 @@ class Peer7WDNode:
                 winner_seat = self.seating_order.index(winner_pid)
                 final_scores_payload = [
                     {"seat": self.seating_order.index(p), "total": s["total"], "coins": self.public_tableaus[p].get("coins", 0)}
-                    for p, s in self.collected_score_reports.items()
+                    for p, s in reports.items()
                 ]
                 self.broadcast_mesh(MSG_GAME_END, {
                     "winner_seat": winner_seat,
@@ -1171,6 +1591,8 @@ class Peer7WDNode:
                 data, addr = self.game_sock.recvfrom(65535)
                 opcode, flags, sender_pid, sess_id, plen, seq, ack, payload = self.unpack_packet(data)
                 self.log("RECV", addr, opcode, seq, ack, flags, payload)
+                if sender_pid in self.manifest:
+                    self.last_heard[sender_pid] = time.time()
 
                 if flags & FLAG_ACK and ack > 0:
                     with self.state_lock:
@@ -1189,6 +1611,8 @@ class Peer7WDNode:
                         self.delivered_seqs[sender_pid].add(seq)
                     self.send_bare_ack(sender_pid, seq)
 
+                if sender_pid in self.disconnected_peers and opcode != MSG_DISCONNECT:
+                    continue   # RFC 11.3: a peer marked DISCONNECTED is excluded from the session
                 if opcode in (MSG_LOBBY_PRESENCE, MSG_LOBBY_LEAVE, MSG_LOBBY_START_VOTE, MSG_LOBBY_START_ACK):
                     self._handle_lobby_packet(opcode, payload, addr)
                 elif opcode == MSG_SPECTATOR_SYNC and self.spectator:
@@ -1210,6 +1634,7 @@ class Peer7WDNode:
                 elif opcode == MSG_PING and not self.spectator:
                     self.send_unreliable(addr, MSG_PONG, {"echo_sent_at_ms": payload.get("sent_at_ms", 0)})
                 elif opcode == MSG_PONG:
+                    self.last_pong[sender_pid] = time.time()
                     rtt = (time.time() * 1000) - payload.get("echo_sent_at_ms", time.time() * 1000)
                     self.channel_rtt[sender_pid] = rtt / 1000.0
                     self.channel_rto_base[sender_pid] = max(0.200, min(RTO_MAX, (rtt / 1000.0) * 2.5))
@@ -1244,8 +1669,11 @@ class Peer7WDNode:
                     print(f"\n[DM from Peer {sender_pid}]: {payload.get('text')}")
                 elif opcode == MSG_GROUP_MESSAGE and not self.spectator:
                     print(f"\n[GROUP CHAT]: {payload.get('text')}")
+                elif opcode == MSG_DISCONNECT:
+                    self._handle_disconnect(sender_pid, payload)
                 elif opcode == MSG_ERROR:
                     print(f"\n[!] ERROR BROADCAST: {payload.get('code')} -> {payload.get('detail')}")
+                    self._handle_error(sender_pid, payload)
 
             except ConnectionResetError:
                 continue
@@ -1263,6 +1691,7 @@ def main():
     parser.add_argument("--lobby_port", type=int, default=7777, help="Lobby discovery port")
     parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose network logging")
     parser.add_argument("--spectator", action="store_true", help="Launch in Creative Extension Spectator Role (Bonus 10 pts)")
+    parser.add_argument("--drop-to", default="", help="TEST ONLY: comma-separated manifest peer ids to silently drop all outgoing game packets to (simulates a dead link)")
     args = parser.parse_args()
 
     node = Peer7WDNode(
@@ -1273,7 +1702,8 @@ def main():
         lobby_port=args.lobby_port,
         verbose=args.verbose,
         spectator=args.spectator,
-        card_db=args.cards
+        card_db=args.cards,
+        drop_to=[int(x) for x in args.drop_to.split(",") if x.strip()]
     )
 
     role_desc = "SPECTATOR MODE (Bonus Extension)" if args.spectator else "PLAYER NODE"
@@ -1290,7 +1720,8 @@ def main():
         print("  board                    - Display live spectator overview")
     print("  ping <peer_id>           - Ping peer to test RTT/RTO")
     print("  verbose                  - Toggle runtime verbose mode on/off")
-    print("  roster                   - Show manifest and seating order")
+    print("  roster                   - Show manifest, seating order and liveness")
+    print("  drop <peer_id>           - TEST ONLY: toggle silently dropping our outgoing packets to a peer")
     print("  quit                     - Exit node\n")
 
     while node.running:
@@ -1321,16 +1752,27 @@ def main():
             elif cmd == "verbose":
                 node.verbose = not node.verbose
                 print(f"[*] Verbose Logging: {'ENABLED' if node.verbose else 'DISABLED'}")
+            elif cmd == "drop" and len(parts) > 1:
+                dpid = int(parts[1])
+                if dpid in node.drop_to_pids:
+                    node.drop_to_pids.discard(dpid)
+                    print(f"[*] No longer dropping outgoing packets to peer {dpid}")
+                else:
+                    node.drop_to_pids.add(dpid)
+                    print(f"[*] TEST: silently dropping ALL outgoing packets to peer {dpid}")
             elif cmd == "roster":
                 print(f"Manifest: {node.manifest_names}")
                 print(f"Seating Ring: {node.seating_order} (My Seat: {node.my_seat})")
+                print(f"Live: {node._live_pids()} | Disconnected: {sorted(node.disconnected_peers)} | Failed channels: {sorted(node.failed_channels)}")
             elif cmd == "quit":
+                node.announce_exit("USER_QUIT")
                 node.leave_lobby()
                 node.running = False
                 break
         except ValueError:
             print("[!] Invalid arguments: peer ids and card indexes must be numbers (use 'roster' to see peer ids).")
         except KeyboardInterrupt:
+            node.announce_exit("USER_QUIT")
             node.leave_lobby()
             node.running = False
             break
