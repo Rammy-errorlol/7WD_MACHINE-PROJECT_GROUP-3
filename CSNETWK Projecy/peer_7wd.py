@@ -103,6 +103,7 @@ class Peer7WDNode:
         self.game_port = game_port
         self.lobby_port = lobby_port
         self.verbose = verbose
+        self.logged_broadcasts: Set[Tuple] = set()
         self.spectator = spectator
         self.running = True
 
@@ -202,6 +203,10 @@ class Peer7WDNode:
     def log(self, direction: str, addr: Tuple[str, int], opcode: int, seq: int, ack: int, flags: int, payload: dict):
         if not self.verbose:
             return
+        key = (direction, opcode, json.dumps(payload, sort_keys=True))
+        if key in self.logged_broadcasts:
+            return
+        self.logged_broadcasts.add(key)
         name = OPCODE_NAMES.get(opcode, f"0x{opcode:02X}")
         ts = time.strftime("%H:%M:%S")
         flag_str = ""
